@@ -6,6 +6,7 @@
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+void *thread(void *vargp);
 void doit(int connfd);
 int parse_uri(const char *uri, char *host, char *port, char *path);
 void build_http_header(char *header, const char *host, const char *path,
@@ -104,19 +105,35 @@ void build_http_header(char *header, const char *host, const char *path,
 
     strcat(header, "\r\n");
 }
+void *thread(void *vargp) {
+    int connfd = *((int *)vargp); 
+    Free(vargp);                  
+
+    Pthread_detach(pthread_self()); 
+
+    doit(connfd); 
+    Close(connfd);
+    return NULL;
+}
 int main(int argc,char **argv)
 {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         exit(1);
     }
+    Signal(SIGPIPE, SIG_IGN);
+
     int listenfd = Open_listenfd(argv[1]);
     while (1) {
         struct sockaddr_storage clientaddr;
         socklen_t clientlen = sizeof(clientaddr);
         int connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-        doit(connfd);
-        Close(connfd);
+
+        int *connfdp=Malloc(sizeof(int));
+        *connfdp=connfd;
+
+        pthread_t tid;
+        pthread_create(&tid,NULL,thread,connfdp);
     }   
     //printf("%s", user_agent_hdr);
     return 0;
