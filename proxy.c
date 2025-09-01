@@ -3,9 +3,128 @@
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define CACHE_LINES 32
+
+typedef struct{
+    char url[MAXLINE];
+    char *obj;
+    size_t size;
+    unsigned long lru_tick;
+} cache_line_t;
+
+typedef struct{
+    cache_line_t lines[CACHE_LINES];
+    size_t total_size;
+    unsigned long tick;
+    pthread_rwlock_t rwlock;
+}cache_t;
+
+static cache_t g_cache;
+
+static void cache_init(void);
+static int cache_lookup(const char *url,char **out_buf,size_t *out_len);
+static void cache_insert(const char *url,const char *buf,size_t len);
+static void cache_evict_until(size_t need);
+static void build_cache_key(const char *host,const char *port,const char *path,char *key,size_t cap);
+
+static void cache_init(void) {
+    memset(&g_cache, 0, sizeof(g_cache));
+    pthread_rwlock_init(&g_cache.rwlock, NULL);
+}
+
+static void build_cache_key(const char *host, const char *port, const char *path,
+                            char *key, size_t cap) {
+    snprintf(key, cap, "http://%s:%s%s", host, port, path);
+}
+static int cache_lookup(const char *url, char **out_buf,size_t *out_len){
+    int hit=0;
+    pthread_rwlock_rdlock(&g_cache.rwlock);
+
+    for(int i=0;i<CACHE_LINES;i++){
+        cache_line_t *L=&g_cache.lines[i];
+        if(L->size>0&&!strcmp(L->url,url)){
+            *out_len=L->size;
+            *out_buf=Malloc(L->size);
+            memcpy(*out_buf,L->obj,L->size);
+
+            hit=1;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&g_cache.rwlock);
+
+    if(hit) {
+        pthread_rwlock_wrlock(&g_cache.rwlock);
+        g_cache.tick++;
+        for(int i=0;i<CACHE_LINES;i++){
+            cache_line_t *L=&g_cache.lines[i];
+            if (L->size > 0 && !strcmp(L->url, url)) {
+                L->lru_tick=g_cache.tick;
+                break;
+            }
+        }
+        pthread_rwlock_unlock(&g_cache.rwlock);
+    }
+    return hit;
+}
+
+static void cache_evict_until(size_t need){
+    while(g_cache.total_size+need>MAX_CACHE_SIZE){
+        int evict_idx=-1;
+        unsigned long best=~0UL;
+        for(int i=0;i<CACHE_LINES;i++){
+            cache_line_t *L=&g_cache.lines[i];
+            if(L->size>0 && L->lru_tick<best){
+                best=L->lru_tick;
+                evict_idx=i;
+            }
+        }
+        if(evict_idx<0)break;
+        cache_line_t *E=&g_cache.lines[evict_idx];
+        g_cache.total_size-=E->size;
+        Free(E->obj);
+        memset(E,0,sizeof(*E));
+    }
+}
+static void cache_insert(const char *url,const char *buf,size_t len){
+    if(len>MAX_OBJECT_SIZE)return;
+    if(len==0)return;
+
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+
+    if(g_cache.total_size+len>MAX_CACHE_SIZE){
+        cache_evict_until(len);
+    }
+    int idx=-1;
+    unsigned long best=~0UL;
+    for(int i=0;i<CACHE_LINES;i++){
+        if(g_cache.lines[i].size==0){
+            idx=i;break;
+        }
+        if(g_cache.lines[i].lru_tick<best){
+            best=g_cache.lines[i].lru_tick;idx=i;
+        }
+    }
+    cache_line_t *L=&g_cache.lines[idx];
+    if(L->size>0){
+        g_cache.total_size-=L->size;
+        Free(L->obj);
+        memset(L,0,sizeof(*L));
+    }
+    strncpy(L->url,url,sizeof(L->url)-1);
+    L->obj=Malloc(len);
+    memcpy(L->obj,buf,len);
+    L->size=len;
+
+    g_cache.tick++;
+    L->lru_tick=g_cache.tick;
+    g_cache.total_size+=len;
+    pthread_rwlock_unlock(&g_cache.rwlock);
+}
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+
 void *thread(void *vargp);
 void doit(int connfd);
 int parse_uri(const char *uri, char *host, char *port, char *path);
@@ -43,11 +162,40 @@ void doit(int connfd)
 
     Rio_writen(serverfd, server_request, strlen(server_request));
 
+    char cache_key[MAXLINE];
+    build_cache_key(host,port,path,cache_key,sizeof(cache_key));
+
+    char *hit_buf=NULL;
+    size_t hit_len=0;
+    if (cache_lookup(cache_key, &hit_buf, &hit_len)) {
+        fprintf(stderr, "[cache] HIT %s (len=%zu)\n", cache_key, hit_len);
+        Rio_writen(connfd, (void *)hit_buf, hit_len);
+        Free(hit_buf);
+        Close(serverfd);
+        return;
+    }
+    fprintf(stderr, "[cache] MISS %s\n", cache_key);
+    size_t cap=MAX_OBJECT_SIZE+1;
+    char *obj_buf=Malloc(cap);
+    size_t obj_len=0;
+
     ssize_t n;
     while ((n = Rio_readnb(&rio_server, buf, MAXLINE)) > 0) {
+
         Rio_writen(connfd, buf, n);
+
+        if (obj_len + (size_t)n <= MAX_OBJECT_SIZE) {
+            memcpy(obj_buf + obj_len, buf, n);
+            obj_len += (size_t)n;
+        }
     }
 
+    if (obj_len > 0 && obj_len <= MAX_OBJECT_SIZE) {
+        cache_insert(cache_key, obj_buf, obj_len);
+        fprintf(stderr, "[cache] INSERT %s (len=%zu)\n", cache_key, obj_len);
+    }
+
+    Free(obj_buf);
     Close(serverfd);
 }
 int parse_uri(const char *uri, char *host, char *port, char *path) {
@@ -122,6 +270,8 @@ int main(int argc,char **argv)
         exit(1);
     }
     Signal(SIGPIPE, SIG_IGN);
+
+    cache_init();
 
     int listenfd = Open_listenfd(argv[1]);
     while (1) {
