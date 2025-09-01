@@ -5,6 +5,9 @@
 #define MAX_OBJECT_SIZE 102400
 #define CACHE_LINES 32
 
+static void parse_host_header_value(const char *host_hdr_value,
+                                    char *host, char *port);
+
 typedef struct{
     char url[MAXLINE];
     char *obj;
@@ -26,7 +29,31 @@ static int cache_lookup(const char *url,char **out_buf,size_t *out_len);
 static void cache_insert(const char *url,const char *buf,size_t len);
 static void cache_evict_until(size_t need);
 static void build_cache_key(const char *host,const char *port,const char *path,char *key,size_t cap);
+static void parse_host_header_value(const char *host_hdr_value,
+                                    char *host, char *port) {
+    char tmp[MAXLINE];
+    size_t len = strnlen(host_hdr_value, sizeof(tmp) - 1);
+    strncpy(tmp, host_hdr_value, len);
+    tmp[len] = '\0';
+    char *s = tmp;
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) --e;
+    *e = '\0';
 
+    char *colon = strchr(s, ':');
+    if (colon) {
+        *colon = '\0';
+        strncpy(host, s, MAXLINE - 1);
+        host[MAXLINE - 1] = '\0';
+        strncpy(port, colon + 1, 15);
+        port[15] = '\0';
+    } else {
+        strncpy(host, s, MAXLINE - 1);
+        host[MAXLINE - 1] = '\0';
+        strcpy(port, "80");
+    }
+}
 static void cache_init(void) {
     memset(&g_cache, 0, sizeof(g_cache));
     pthread_rwlock_init(&g_cache.rwlock, NULL);
@@ -148,53 +175,76 @@ void doit(int connfd)
         Rio_writen(connfd, (void *)msg, strlen(msg));
         return;
     }
-    parse_uri(uri, host, port, path);
-
     client_headers[0] = '\0';
+    char host_hdr_value[MAXLINE]; host_hdr_value[0] = '\0';
+
     while (Rio_readlineb(&rio_client, buf, MAXLINE) > 0) {
-        if (!strcmp(buf, "\r\n")) break;
-        strcat(client_headers, buf);
+        if (!strcmp(buf, "\r\n")) break;  
+        if (!strncasecmp(buf, "Host:", 5)) {
+            const char *v = buf + 5;
+            strncpy(host_hdr_value, v, sizeof(host_hdr_value) - 1);
+            host_hdr_value[sizeof(host_hdr_value) - 1] = '\0';
+        }
+        strncat(client_headers, buf, sizeof(client_headers) - 1 - strlen(client_headers));
     }
 
-    build_http_header(server_request, host, path, port, client_headers);
-    int serverfd = Open_clientfd(host, port);
-    Rio_readinitb(&rio_server, serverfd);
 
-    Rio_writen(serverfd, server_request, strlen(server_request));
+    host[0] = port[0] = path[0] = '\0';
+
+    if (!strncasecmp(uri, "http://", 7)) {
+        parse_uri(uri, host, port, path);
+    } else if (uri[0] == '/') {
+        if (host_hdr_value[0] == '\0') {
+            const char *msg = "HTTP/1.0 400 Bad Request\r\n\r\n";
+            Rio_writen(connfd, (void *)msg, strlen(msg));
+            return;
+        }
+        parse_host_header_value(host_hdr_value, host, port);
+        strncpy(path, uri, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        const char *msg = "HTTP/1.0 400 Bad Request\r\n\r\n";
+        Rio_writen(connfd, (void *)msg, strlen(msg));
+        return;
+    }
 
     char cache_key[MAXLINE];
-    build_cache_key(host,port,path,cache_key,sizeof(cache_key));
+    build_cache_key(host, port, path, cache_key, sizeof(cache_key));
 
-    char *hit_buf=NULL;
-    size_t hit_len=0;
+    char *hit_buf = NULL;
+    size_t hit_len = 0;
     if (cache_lookup(cache_key, &hit_buf, &hit_len)) {
         fprintf(stderr, "[cache] HIT %s (len=%zu)\n", cache_key, hit_len);
         Rio_writen(connfd, (void *)hit_buf, hit_len);
         Free(hit_buf);
-        Close(serverfd);
         return;
     }
-    fprintf(stderr, "[cache] MISS %s\n", cache_key);
-    size_t cap=MAX_OBJECT_SIZE+1;
-    char *obj_buf=Malloc(cap);
-    size_t obj_len=0;
+
+    build_http_header(server_request, host, path, port, client_headers);
+
+    int serverfd = Open_clientfd(host, port);
+    Rio_readinitb(&rio_server, serverfd);
+
+    size_t cap = MAX_OBJECT_SIZE + 1;
+    char *obj_buf = Malloc(cap);
+    size_t obj_len = 0;
+
+    Rio_writen(serverfd, server_request, strlen(server_request));
 
     ssize_t n;
     while ((n = Rio_readnb(&rio_server, buf, MAXLINE)) > 0) {
-
         Rio_writen(connfd, buf, n);
-
         if (obj_len + (size_t)n <= MAX_OBJECT_SIZE) {
             memcpy(obj_buf + obj_len, buf, n);
             obj_len += (size_t)n;
         }
     }
+    Close(serverfd);
 
     if (obj_len > 0 && obj_len <= MAX_OBJECT_SIZE) {
         cache_insert(cache_key, obj_buf, obj_len);
         fprintf(stderr, "[cache] INSERT %s (len=%zu)\n", cache_key, obj_len);
     }
-
     Free(obj_buf);
     Close(serverfd);
 }
@@ -288,3 +338,4 @@ int main(int argc,char **argv)
     //printf("%s", user_agent_hdr);
     return 0;
 }
+
