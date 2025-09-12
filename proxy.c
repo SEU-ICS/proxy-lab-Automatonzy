@@ -4,7 +4,7 @@
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 #define CACHE_LINES 32
-
+//
 static void parse_host_header_value(const char *host_hdr_value,
                                     char *host, char *port);
 
